@@ -524,8 +524,9 @@ class DataVisualizer:
     def create_histogram(self, data: pd.DataFrame, column: str, bins: int = 30, 
                          color: str = 'blue', title: str = None) -> plt.Figure:
         """히스토그램 생성"""
+        logger.info(f"히스토그램 생성")
         if column not in data.columns:
-            logger.error(f"열 '{column}'이 데이터셋에 없습니다.")
+            logger.error(f"열 '{colunm}'이 데이터셋에 없습니다.")
             return None
         
         if not pd.api.types.is_numeric_dtype(data[column]):
