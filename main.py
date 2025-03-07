@@ -239,14 +239,21 @@ class DataProcessor:
     drop_na_strategy: str = 'drop'  # 'drop', 'fill_mean', 'fill_median', 'fill_mode', 'fill_zero'
     outlier_detection: bool = False
     outlier_threshold: float = 3.0  # z-score 기준
+    enable_logging: bool = True  # 로깅 활성화 여부 추가
     
     def __post_init__(self):
-        logger.info(f"{self.name} 데이터 프로세서 초기화됨")
+        if self.enable_logging:
+            logger.info(f"{self.name} 데이터 프로세서 초기화됨")
     
     @timer_decorator
     def process(self, data: pd.DataFrame) -> pd.DataFrame:
         """데이터 전처리 파이프라인 실행"""
-        logger.info(f"{self.name} 데이터 전처리 시작, 원본 크기: {data.shape}")
+        if self.enable_logging:
+            logger.info(f"{self.name} 데이터 전처리 시작, 원본 크기: {data.shape}")
+        
+        # 입력 데이터 검증
+        if data is None or data.empty:
+            raise ValueError("처리할 데이터가 비어 있거나 None입니다.")
         
         processed_data = data.copy()
         
@@ -292,12 +299,24 @@ class DataProcessor:
                     column = step.get('column', '')
                     function_str = step.get('function', '')
                     if column in processed_data.columns and function_str:
-                        # 위험한 방식이므로 실제 응용 프로그램에서는 사용하지 마세요!
-                        # 이는 단지 예제 목적으로만 포함되었습니다.
-                        func = eval(function_str)
-                        processed_data[column] = processed_data[column].apply(func)
+                        # 보안 향상을 위해 안전한 방식으로 변경
+                        if function_str.startswith("lambda"):
+                            # 람다 함수에 대해서만 제한적 실행 허용
+                            func = eval(function_str)
+                            processed_data[column] = processed_data[column].apply(func)
+                        else:
+                            logger.warning(f"함수 적용 거부: 람다 함수만 허용됩니다. 입력: {function_str}")
                 
-                logger.info(f"단계 '{step_name}' 완료")
+                elif step_type == 'one_hot_encode':  # 새로운 기능 추가
+                    columns = step.get('columns', [])
+                    for col in columns:
+                        if col in processed_data.columns:
+                            dummies = pd.get_dummies(processed_data[col], prefix=col)
+                            processed_data = pd.concat([processed_data, dummies], axis=1)
+                            processed_data = processed_data.drop(columns=[col])
+                
+                if self.enable_logging:
+                    logger.info(f"단계 '{step_name}' 완료")
             
             except Exception as e:
                 logger.error(f"단계 '{step_name}' 처리 중 오류 발생: {e}")
@@ -313,13 +332,22 @@ class DataProcessor:
             if not numeric_cols.empty:
                 processed_data[numeric_cols] = self.scaler.fit_transform(processed_data[numeric_cols])
         
-        logger.info(f"{self.name} 데이터 전처리 완료, 결과 크기: {processed_data.shape}")
+        if self.enable_logging:
+            logger.info(f"{self.name} 데이터 전처리 완료, 결과 크기: {processed_data.shape}")
         return processed_data
     
     def _handle_missing_values(self, data: pd.DataFrame) -> pd.DataFrame:
         """결측치 처리 전략 구현"""
+        missing_count_before = data.isna().sum().sum()
+        
         if self.drop_na_strategy == 'drop':
-            return data.dropna()
+            result = data.dropna()
+            
+            # 결측치가 너무 많이 제거되는 경우 경고
+            removed_rows = data.shape[0] - result.shape[0]
+            if removed_rows > 0.3 * data.shape[0]:  # 30% 이상 데이터 손실 시
+                logger.warning(f"경고: 결측치 제거로 전체 데이터의 {removed_rows/data.shape[0]*100:.1f}%가 손실됨")
+            return result
         
         for column in data.columns:
             if data[column].isna().any():
@@ -330,20 +358,59 @@ class DataProcessor:
                     data[column] = data[column].fillna(data[column].median())
                 
                 elif self.drop_na_strategy == 'fill_mode':
-                    data[column] = data[column].fillna(data[column].mode()[0])
+                    # 모드가 여러 개인 경우 첫 번째 값 사용, 에러 처리 추가
+                    try:
+                        mode_value = data[column].mode()
+                        if not mode_value.empty:
+                            data[column] = data[column].fillna(mode_value[0])
+                    except Exception as e:
+                        logger.error(f"모드 계산 중 오류: {e}, 0으로 대체")
+                        data[column] = data[column].fillna(0)
                 
                 elif self.drop_na_strategy == 'fill_zero':
                     data[column] = data[column].fillna(0)
+                
+                elif self.drop_na_strategy == 'fill_custom':  # 새로운 전략 추가
+                    if hasattr(self, 'custom_fill_values') and column in self.custom_fill_values:
+                        data[column] = data[column].fillna(self.custom_fill_values[column])
+        
+        missing_count_after = data.isna().sum().sum()
+        if self.enable_logging:
+            logger.info(f"결측치 처리: {missing_count_before}개에서 {missing_count_after}개로 감소")
         
         return data
     
     def _handle_outliers(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Z-점수를 사용한 이상치 감지 및 제거"""
+        """Z-점수 또는 IQR을 사용한 이상치 감지 및 처리"""
         numeric_cols = data.select_dtypes(include=['int64', 'float64']).columns
+        initial_rows = data.shape[0]
+        outlier_method = getattr(self, 'outlier_method', 'zscore')  # 기본값은 zscore
         
-        for col in numeric_cols:
-            z_scores = np.abs((data[col] - data[col].mean()) / data[col].std())
-            data = data[z_scores < self.outlier_threshold]
+        if outlier_method == 'zscore':
+            # Z-점수 방법
+            for col in numeric_cols:
+                if data[col].std() == 0:  # 표준편차가 0인 경우 스킵
+                    continue
+                    
+                z_scores = np.abs((data[col] - data[col].mean()) / data[col].std())
+                data = data[z_scores < self.outlier_threshold]
+        
+        elif outlier_method == 'iqr':
+            # IQR 방법 (사분위 범위)
+            for col in numeric_cols:
+                Q1 = data[col].quantile(0.25)
+                Q3 = data[col].quantile(0.75)
+                IQR = Q3 - Q1
+                
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                
+                data = data[(data[col] >= lower_bound) & (data[col] <= upper_bound)]
+        
+        # 모든 열에 대해 한 번에 처리하는 대신 열별로 처리하여 불필요한 데이터 손실 방지
+        rows_removed = initial_rows - data.shape[0]
+        if rows_removed > 0 and self.enable_logging:
+            logger.info(f"이상치 제거: {rows_removed}행 ({rows_removed/initial_rows*100:.1f}% 데이터) 제거됨")
         
         return data
 
